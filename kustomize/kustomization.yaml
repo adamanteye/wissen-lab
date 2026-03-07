@@ -1,0 +1,8 @@
+resources:
+  - deployment.yaml
+  - service.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/name: wissen-lab
+    includeSelectors: true
+    includeTemplates: true

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wissen-lab
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - image: localhost/wissen-lab:latest
+          imagePullPolicy: IfNotPresent
+          name: wissen-lab
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: PG_HOST
+              value: postgresql
+            - name: PG_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql
+                  key: postgres-password
+            - name: LLAMA_SERVER_MIN_INTERVAL_SECONDS
+              value: "0.5"
+            - name: GITLAB_URL
+              value: https://gitlab.example.com
+            - name: GITLAB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-token
+                  key: token
+            - name: LLAMA_SERVER_URL
+              value: https://llama.cpp.example.com/embedding
+            - name: LLAMA_SERVER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llama-cpp-token
+                  key: token
+            - name: SEARCH_EMBED_CACHE_SIZE
+              value: "256"
+        - image: localhost/wissen-front:latest
+          imagePullPolicy: IfNotPresent
+          name: wissen-front
+          ports:
+            - containerPort: 80
+              name: http

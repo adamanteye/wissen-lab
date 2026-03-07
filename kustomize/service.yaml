@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: wissen-lab
+spec:
+  ports:
+    - name: lab
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    - name: front
+      port: 80
+      protocol: TCP
+      targetPort: 80
