@@ -2,11 +2,16 @@
 
 GitLab fact indexer.
 
-- Reconcile GitLab projects, issues, merge requests, and commits.
-- Chunk source text.
-- Embed with llama-server.
+## What It Does
+
+- Reconcile GitLab projects.
+- Read issues, merge requests, commits, and notes.
+- Split long text into chunks.
+- Embed chunks with llama-server.
 - Store vectors in Postgres with pgvector.
-- Search returns source links and content.
+- Search by text.
+- Return content with source links.
+- Serve a small search frontend.
 
 ## Environment
 
