@@ -84,7 +84,6 @@ function SearchPage() {
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder="What changed in mail config?"
             rows={4}
           />
           <div className="actions">
