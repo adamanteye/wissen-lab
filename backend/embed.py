@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from chunking import ChunkResult
-from db import store_embedding_async
+from db import replace_embeddings_async
 from logutil import get_logger
 
 LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "").rstrip("/")
@@ -18,8 +18,8 @@ logger = get_logger("llama_server")
 content_queue = asyncio.Queue()
 consumer_task = None
 search_embedding_cache = {}
-request_rate_lock = asyncio.Lock()
-last_request_at = 0.0
+consumer_failure_count = 0
+unfinished_job_count = 0
 
 
 @dataclass
@@ -41,7 +41,26 @@ class EmbedJob:
 class LlamaServerEmbed:
     async def accept(self, source_kind: str, chunk_result: ChunkResult):
         jobs = await producer(source_kind, chunk_result)
-        return await asyncio.gather(*(job.future for job in jobs))
+        vectors = await asyncio.gather(*(job.future for job in jobs))
+        records = [
+            {
+                "repo_id": job.item.repo_id,
+                "source_kind": job.item.source_kind,
+                "source_key": job.item.source_key,
+                "chunk_index": job.item.chunk_index,
+                "locator_id": job.item.locator_id,
+                "content": job.item.content,
+                "embedding": vector,
+            }
+            for job, vector in zip(jobs, vectors)
+        ]
+        await replace_embeddings_async(
+            chunk_result.repo_id,
+            source_kind,
+            chunk_result.id,
+            records,
+        )
+        return records
 
 
 async def embed_search_text(content: str):
@@ -71,7 +90,7 @@ async def producer(source_kind: str, chunk_result: ChunkResult):
             content=chunk.content,
         )
         job = EmbedJob(item=item, future=loop.create_future())
-        await content_queue.put(job)
+        await enqueue_job(job)
         jobs.append(job)
 
     return jobs
@@ -80,37 +99,46 @@ async def producer(source_kind: str, chunk_result: ChunkResult):
 async def consumer():
     async with aiohttp.ClientSession() as session:
         while True:
-            first = await content_queue.get()
-            jobs = [first]
-
-            while True:
-                try:
-                    job = content_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                jobs.append(job)
+            job = await content_queue.get()
 
             try:
-                vectors = await fetch_embeddings(
-                    session,
-                    [job.item.content for job in jobs],
+                logger.info(
+                    "embedding chunk repo_id=%s source_kind=%s source_key=%s chunk_index=%s locator_id=%s content_length=%s",
+                    job.item.repo_id,
+                    job.item.source_kind,
+                    job.item.source_key,
+                    job.item.chunk_index,
+                    job.item.locator_id,
+                    len(job.item.content),
                 )
 
-                for job, vector in zip(jobs, vectors):
-                    record = await store_embedding(job.item, vector)
-                    if not job.future.done():
-                        job.future.set_result(record)
-            except Exception as exc:
+                await wait_for_request_slot()
+                vector = await fetch_native_embedding(session, job.item.content)
+                register_consumer_success()
+
+                if not job.future.done():
+                    job.future.set_result(vector)
+            except Exception:
+                register_consumer_failure()
                 logger.exception(
-                    "llama-server batch processing failed job_count=%s",
-                    len(jobs),
+                    "llama-server request failed repo_id=%s source_kind=%s source_key=%s chunk_index=%s failure_count=%s",
+                    job.item.repo_id,
+                    job.item.source_kind,
+                    job.item.source_key,
+                    job.item.chunk_index,
+                    consumer_failure_count,
                 )
-                for job in jobs:
-                    if not job.future.done():
-                        job.future.set_exception(exc)
+                if consumer_failure_count >= 5:
+                    logger.critical(
+                        "llama-server accumulated failure limit reached failure_count=%s",
+                        consumer_failure_count,
+                    )
+                    os._exit(1)
+
+                await enqueue_job(job)
             finally:
-                for _ in jobs:
-                    content_queue.task_done()
+                mark_job_finished()
+                content_queue.task_done()
 
 
 async def fetch_embeddings(session: aiohttp.ClientSession, texts: list[str]):
@@ -145,7 +173,6 @@ def embedding_headers():
 
 async def fetch_native_embedding(session: aiohttp.ClientSession, text: str):
     url = embedding_url()
-    await wait_for_request_slot()
 
     try:
         async with session.post(
@@ -175,19 +202,61 @@ async def fetch_native_embedding(session: aiohttp.ClientSession, text: str):
 
 
 async def wait_for_request_slot():
-    global last_request_at
+    wait_seconds = request_wait_seconds()
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
 
-    if LLAMA_SERVER_MIN_INTERVAL_SECONDS <= 0:
+
+async def enqueue_job(job: EmbedJob):
+    await maybe_wait_for_backlog()
+    increment_unfinished_jobs()
+    await content_queue.put(job)
+
+
+async def maybe_wait_for_backlog():
+    n = unfinished_job_count
+    if n <= 5:
         return
 
-    loop = asyncio.get_running_loop()
+    wait_seconds = max(
+        LLAMA_SERVER_MIN_INTERVAL_SECONDS,
+        LLAMA_SERVER_MIN_INTERVAL_SECONDS * 2 ** (n - 1),
+    )
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
 
-    async with request_rate_lock:
-        now = loop.time()
-        wait_seconds = last_request_at + LLAMA_SERVER_MIN_INTERVAL_SECONDS - now
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
-        last_request_at = loop.time()
+
+def request_wait_seconds():
+    if LLAMA_SERVER_MIN_INTERVAL_SECONDS <= 0:
+        return 0.0
+
+    if consumer_failure_count <= 0:
+        return LLAMA_SERVER_MIN_INTERVAL_SECONDS
+
+    return max(
+        LLAMA_SERVER_MIN_INTERVAL_SECONDS,
+        LLAMA_SERVER_MIN_INTERVAL_SECONDS * 2 ** (consumer_failure_count - 1),
+    )
+
+
+def register_consumer_success():
+    global consumer_failure_count
+    consumer_failure_count = max(0, consumer_failure_count - 1)
+
+
+def register_consumer_failure():
+    global consumer_failure_count
+    consumer_failure_count += 1
+
+
+def increment_unfinished_jobs():
+    global unfinished_job_count
+    unfinished_job_count += 1
+
+
+def mark_job_finished():
+    global unfinished_job_count
+    unfinished_job_count = max(0, unfinished_job_count - 1)
 
 
 def parse_embedding_payload(payload):
@@ -219,20 +288,6 @@ def normalize_embedding(embedding):
         return first
 
     return None
-
-
-async def store_embedding(item: EmbedItem, vector: list[float]):
-    record = {
-        "repo_id": item.repo_id,
-        "source_kind": item.source_kind,
-        "source_key": item.source_key,
-        "chunk_index": item.chunk_index,
-        "locator_id": item.locator_id,
-        "content": item.content,
-        "embedding": vector,
-    }
-    await store_embedding_async(record)
-    return record
 
 
 def start_consumer():

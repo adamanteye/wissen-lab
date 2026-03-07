@@ -373,8 +373,12 @@ class Database:
                 )
             conn.commit()
 
-    def delete_embeddings(
-        self, repo_id: int, source_kind: str, source_key: str
+    def replace_embeddings(
+        self,
+        repo_id: int,
+        source_kind: str,
+        source_key: str,
+        records: list[dict],
     ) -> None:
         with self.connection() as conn:
             with conn.cursor() as cur:
@@ -387,52 +391,42 @@ class Database:
                     """,
                     (repo_id, source_kind, source_key),
                 )
-            conn.commit()
 
-    def store_embedding(self, record: dict) -> None:
-        vector_value = self._vector_value(record["embedding"])
-
-        with self.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO gitlab_embedding (
-                        repo_id,
-                        source_kind,
-                        source_key,
-                        chunk_index,
-                        locator_id,
-                        content,
-                        embedding,
-                        updated_at
+                for record in records:
+                    vector_value = self._vector_value(record["embedding"])
+                    cur.execute(
+                        """
+                        INSERT INTO gitlab_embedding (
+                            repo_id,
+                            source_kind,
+                            source_key,
+                            chunk_index,
+                            locator_id,
+                            content,
+                            embedding,
+                            updated_at
+                        )
+                        VALUES (
+                            %(repo_id)s,
+                            %(source_kind)s,
+                            %(source_key)s,
+                            %(chunk_index)s,
+                            %(locator_id)s,
+                            %(content)s,
+                            %(embedding)s::vector,
+                            now()
+                        )
+                        """,
+                        {
+                            "repo_id": record["repo_id"],
+                            "source_kind": record["source_kind"],
+                            "source_key": record["source_key"],
+                            "chunk_index": record["chunk_index"],
+                            "locator_id": record["locator_id"],
+                            "content": record["content"],
+                            "embedding": vector_value,
+                        },
                     )
-                    VALUES (
-                        %(repo_id)s,
-                        %(source_kind)s,
-                        %(source_key)s,
-                        %(chunk_index)s,
-                        %(locator_id)s,
-                        %(content)s,
-                        %(embedding)s::vector,
-                        now()
-                    )
-                    ON CONFLICT (repo_id, source_kind, source_key, chunk_index)
-                    DO UPDATE SET
-                        locator_id = EXCLUDED.locator_id,
-                        content = EXCLUDED.content,
-                        embedding = EXCLUDED.embedding,
-                        updated_at = now()
-                    """,
-                    {
-                        "repo_id": record["repo_id"],
-                        "source_kind": record["source_kind"],
-                        "source_key": record["source_key"],
-                        "chunk_index": record["chunk_index"],
-                        "locator_id": record["locator_id"],
-                        "content": record["content"],
-                        "embedding": vector_value,
-                    },
-                )
             conn.commit()
 
     def search_embeddings(
@@ -672,41 +666,38 @@ async def upsert_commit_async(commit: Commit) -> None:
     await asyncio.to_thread(upsert_commit, commit)
 
 
-def delete_embeddings(repo_id: int, source_kind: str, source_key: str) -> None:
+def replace_embeddings(
+    repo_id: int,
+    source_kind: str,
+    source_key: str,
+    records: list[dict],
+) -> None:
     try:
-        database.delete_embeddings(repo_id, source_kind, source_key)
+        database.replace_embeddings(repo_id, source_kind, source_key, records)
     except Exception:
         logger.exception(
-            "postgres delete failed repo_id=%s source_kind=%s source_key=%s",
+            "postgres replace failed repo_id=%s source_kind=%s source_key=%s record_count=%s",
             repo_id,
             source_kind,
             source_key,
+            len(records),
         )
         raise
 
 
-async def delete_embeddings_async(
-    repo_id: int, source_kind: str, source_key: str
+async def replace_embeddings_async(
+    repo_id: int,
+    source_kind: str,
+    source_key: str,
+    records: list[dict],
 ) -> None:
-    await asyncio.to_thread(delete_embeddings, repo_id, source_kind, source_key)
-
-
-def store_embedding(record: dict) -> None:
-    try:
-        database.store_embedding(record)
-    except Exception:
-        logger.exception(
-            "postgres insert failed repo_id=%s source_kind=%s source_key=%s chunk_index=%s",
-            record["repo_id"],
-            record["source_kind"],
-            record["source_key"],
-            record["chunk_index"],
-        )
-        raise
-
-
-async def store_embedding_async(record: dict) -> None:
-    await asyncio.to_thread(store_embedding, record)
+    await asyncio.to_thread(
+        replace_embeddings,
+        repo_id,
+        source_kind,
+        source_key,
+        records,
+    )
 
 
 def search_embeddings(

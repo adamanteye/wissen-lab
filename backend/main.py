@@ -10,7 +10,6 @@ from chunking import (
     MergeRequestChunkBuilder,
 )
 from db import (
-    delete_embeddings_async,
     ensure_repo_async,
     get_repo_async,
     init_db_async,
@@ -41,12 +40,6 @@ reconcile_task = None
 
 
 async def index_chunk_result(source_kind: str, chunk_result):
-    await delete_embeddings_async(
-        chunk_result.repo_id,
-        source_kind,
-        chunk_result.id,
-    )
-
     embedder = LlamaServerEmbed()
     return await embedder.accept(source_kind, chunk_result)
 
