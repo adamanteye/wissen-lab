@@ -102,30 +102,22 @@ async def consumer():
             job = await content_queue.get()
 
             try:
-                logger.info(
-                    "embedding chunk repo_id=%s source_kind=%s source_key=%s chunk_index=%s locator_id=%s content_length=%s",
-                    job.item.repo_id,
-                    job.item.source_kind,
-                    job.item.source_key,
-                    job.item.chunk_index,
-                    job.item.locator_id,
-                    len(job.item.content),
-                )
-
                 await wait_for_request_slot()
                 vector = await fetch_native_embedding(session, job.item.content)
                 register_consumer_success()
+                logger.info(
+                    "embedding success %s failure_count=%s",
+                    format_job_log(job),
+                    consumer_failure_count,
+                )
 
                 if not job.future.done():
                     job.future.set_result(vector)
             except Exception:
                 register_consumer_failure()
                 logger.exception(
-                    "llama-server request failed repo_id=%s source_kind=%s source_key=%s chunk_index=%s failure_count=%s",
-                    job.item.repo_id,
-                    job.item.source_kind,
-                    job.item.source_key,
-                    job.item.chunk_index,
+                    "llama-server request failed %s failure_count=%s",
+                    format_job_log(job),
                     consumer_failure_count,
                 )
                 if consumer_failure_count >= 5:
@@ -180,8 +172,16 @@ async def fetch_native_embedding(session: aiohttp.ClientSession, text: str):
             json={"content": text},
             headers=embedding_headers(),
         ) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
+            payload = await read_json_response(resp)
+            if resp.status >= 400:
+                message = error_message_from_payload(payload)
+                logger.error(
+                    "llama-server request failed url=%s status=%s message=%s",
+                    url,
+                    resp.status,
+                    message,
+                )
+                resp.raise_for_status()
     except aiohttp.ClientError:
         logger.exception("llama-server request failed url=%s", url)
         raise
@@ -199,6 +199,37 @@ async def fetch_native_embedding(session: aiohttp.ClientSession, text: str):
         type(payload).__name__,
     )
     raise ValueError("invalid llama-server response")
+
+
+async def read_json_response(resp: aiohttp.ClientResponse):
+    try:
+        return await resp.json()
+    except Exception:
+        text = await resp.text()
+        logger.error(
+            "llama-server returned non-json response url=%s status=%s body=%r",
+            str(resp.url),
+            resp.status,
+            text[:200],
+        )
+        raise
+
+
+def error_message_from_payload(payload) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return message
+
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+
+    return None
 
 
 async def wait_for_request_slot():
@@ -257,6 +288,20 @@ def increment_unfinished_jobs():
 def mark_job_finished():
     global unfinished_job_count
     unfinished_job_count = max(0, unfinished_job_count - 1)
+
+
+def format_job_log(job: EmbedJob) -> str:
+    return (
+        "repo_id=%s source_kind=%s source_key=%s chunk_index=%s "
+        "locator_id=%s content_length=%s"
+    ) % (
+        job.item.repo_id,
+        job.item.source_kind,
+        job.item.source_key,
+        job.item.chunk_index,
+        job.item.locator_id,
+        len(job.item.content),
+    )
 
 
 def parse_embedding_payload(payload):

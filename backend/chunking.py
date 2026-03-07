@@ -1,4 +1,8 @@
+import os
 from dataclasses import dataclass, field
+
+
+BATCH_SIZE_LIMIT = int(os.getenv("BATCH_SIZE_LIMIT", "8192"))
 
 
 @dataclass
@@ -148,30 +152,56 @@ class Commit:
 
 class ChunkBuilder:
     def _chunk(
-        self, content: str, locator_id: str | None = None
-    ) -> Chunk | None:
+        self,
+        content: str,
+        locator_id: str | None = None,
+        split_locator_prefix: str | None = None,
+    ) -> list[Chunk]:
         content = content.strip()
         if not content:
-            return None
+            return []
 
-        return Chunk(
-            content=content,
-            metadata=ChunkMetadata(locator_id=locator_id),
-        )
+        if len(content) <= BATCH_SIZE_LIMIT:
+            return [
+                Chunk(
+                    content=content,
+                    metadata=ChunkMetadata(locator_id=locator_id),
+                )
+            ]
+
+        parts = []
+        base_locator = locator_id or split_locator_prefix or "chunk"
+        for index, start in enumerate(range(0, len(content), BATCH_SIZE_LIMIT)):
+            parts.append(
+                Chunk(
+                    content=content[start : start + BATCH_SIZE_LIMIT],
+                    metadata=ChunkMetadata(
+                        locator_id=f"{base_locator}-batch{index}"
+                    ),
+                )
+            )
+        return parts
 
 
 class IssueChunkBuilder(ChunkBuilder):
     def build(self, issue: Issue) -> ChunkResult:
         chunks = []
 
-        root = self._chunk(self._root_content(issue))
-        if root:
-            chunks.append(root)
+        chunks.extend(
+            self._chunk(
+                self._root_content(issue),
+                split_locator_prefix="root",
+            )
+        )
 
         for note in issue.notes:
-            chunk = self._chunk(note.body, str(note.id))
-            if chunk:
-                chunks.append(chunk)
+            chunks.extend(
+                self._chunk(
+                    note.body,
+                    str(note.id),
+                    split_locator_prefix=str(note.id),
+                )
+            )
 
         return ChunkResult(
             repo_id=issue.repo_id,
@@ -189,14 +219,21 @@ class CommitChunkBuilder(ChunkBuilder):
     def build(self, commit: Commit) -> ChunkResult:
         chunks = []
 
-        message_chunk = self._chunk(commit.message)
-        if message_chunk:
-            chunks.append(message_chunk)
+        chunks.extend(
+            self._chunk(
+                commit.message,
+                split_locator_prefix="message",
+            )
+        )
 
         for diff in commit.diffs:
-            chunk = self._chunk(diff.diff, diff.path)
-            if chunk:
-                chunks.append(chunk)
+            chunks.extend(
+                self._chunk(
+                    diff.diff,
+                    diff.path,
+                    split_locator_prefix=diff.path,
+                )
+            )
 
         return ChunkResult(
             repo_id=commit.repo_id,
@@ -209,14 +246,21 @@ class MergeRequestChunkBuilder(ChunkBuilder):
     def build(self, merge_request: MergeRequest) -> ChunkResult:
         chunks = []
 
-        root = self._chunk(self._root_content(merge_request))
-        if root:
-            chunks.append(root)
+        chunks.extend(
+            self._chunk(
+                self._root_content(merge_request),
+                split_locator_prefix="root",
+            )
+        )
 
         for note in merge_request.notes:
-            chunk = self._chunk(note.body, str(note.id))
-            if chunk:
-                chunks.append(chunk)
+            chunks.extend(
+                self._chunk(
+                    note.body,
+                    str(note.id),
+                    split_locator_prefix=str(note.id),
+                )
+            )
 
         return ChunkResult(
             repo_id=merge_request.repo_id,

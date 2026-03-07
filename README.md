@@ -17,6 +17,7 @@ GitLab fact indexer.
 - `LLAMA_SERVER_URL`: llama-server URL.
 - `LLAMA_SERVER_API_KEY`: llama-server API key.
 - `LLAMA_SERVER_MIN_INTERVAL_SECONDS`: Min seconds between embedding requests.
+- `BATCH_SIZE_LIMIT`: Max chars per chunk before split. Default `8192`.
 
 ## `/search` Example Response
 
