@@ -12,7 +12,7 @@ spec:
           name: wissen-lab
           ports:
             - containerPort: 8000
-              name: http
+              name: lab
           env:
             - name: PG_HOST
               value: postgresql
@@ -44,4 +44,4 @@ spec:
           name: wissen-front
           ports:
             - containerPort: 80
-              name: http
+              name: front
