@@ -1,6 +1,6 @@
 export interface SearchResult {
-  repo_id: number;
-  repo_path: string;
+  project_id: number;
+  project_path: string;
   source_kind: string;
   source_key: string;
   chunk_index: number;

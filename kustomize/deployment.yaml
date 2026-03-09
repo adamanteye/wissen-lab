@@ -21,8 +21,6 @@ spec:
                 secretKeyRef:
                   name: postgresql
                   key: postgres-password
-            - name: LLAMA_SERVER_MIN_INTERVAL_SECONDS
-              value: "0.5"
             - name: GITLAB_URL
               value: https://gitlab.example.com
             - name: GITLAB_API_TOKEN
@@ -37,8 +35,6 @@ spec:
                 secretKeyRef:
                   name: llama-cpp-token
                   key: token
-            - name: SEARCH_EMBED_CACHE_SIZE
-              value: "256"
         - image: localhost/wissen-front:latest
           imagePullPolicy: IfNotPresent
           name: wissen-front

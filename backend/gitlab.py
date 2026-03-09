@@ -12,6 +12,15 @@ GITLAB_API_TOKEN = os.getenv("GITLAB_API_TOKEN", "")
 logger = get_logger("gitlab")
 
 
+class GitLabNotFoundError(Exception):
+    def __init__(self, url: str, params: dict | None = None) -> None:
+        self.url = url
+        self.params = params
+        super().__init__(
+            f"gitlab resource not found url={url} params={params}"
+        )
+
+
 class GitLabClient:
     def __init__(
         self, base_url: str = GITLAB_URL, api_token: str = GITLAB_API_TOKEN
@@ -112,6 +121,13 @@ class GitLabClient:
         )
         return self._get(path)
 
+    def get_branch(self, project_id: str | int, branch_name: str) -> dict:
+        path = (
+            f"/api/v4/projects/{quote(str(project_id), safe='')}"
+            f"/repository/branches/{quote(branch_name, safe='')}"
+        )
+        return self._get(path)
+
     def list_commit_diffs(self, project_id: str | int, sha: str) -> list[dict]:
         path = (
             f"/api/v4/projects/{quote(str(project_id), safe='')}"
@@ -195,6 +211,19 @@ class GitLabClient:
             )
             response.raise_for_status()
             return response.json()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                logger.warning(
+                    "gitlab resource not found url=%s params=%s",
+                    url,
+                    params,
+                )
+                raise GitLabNotFoundError(url, params) from exc
+
+            logger.exception(
+                "gitlab request failed url=%s params=%s", url, params
+            )
+            raise
         except requests.RequestException:
             logger.exception(
                 "gitlab request failed url=%s params=%s", url, params

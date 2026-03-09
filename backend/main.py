@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -10,33 +11,47 @@ from chunking import (
     MergeRequestChunkBuilder,
 )
 from db import (
+    claim_task_async,
+    commit_needs_index_async,
+    complete_task_async,
+    count_remaining_tasks_async,
+    enqueue_branch_missing_commits_async,
+    enqueue_project_tasks_async,
+    enqueue_task_async,
     ensure_repo_async,
+    fail_task_async,
     get_repo_async,
     init_db_async,
+    mark_branch_deleted_async,
+    mark_commit_indexed_async,
     search_embeddings_async,
-    update_repo_state_async,
+    settle_repo_activity_async,
+    upsert_branch_async,
     upsert_commit_async,
+    upsert_commit_placeholder_async,
     upsert_issue_graph_async,
     upsert_merge_request_graph_async,
 )
-from embed import (
-    LlamaServerEmbed,
-    embed_search_text,
-    start_consumer,
-    stop_consumer,
-)
-from gitlab import GitLabClient
+from embed import LlamaServerEmbed, embed_search_text
+from gitlab import GitLabClient, GitLabNotFoundError
 from logutil import get_logger
 
 logger = get_logger("api")
 
 EPOCH = "1970-01-01T00:00:00Z"
-ZERO_SHA = "0" * 40
 RECONCILE_INTERVAL_SECONDS = 300
+TASK_IDLE_SECONDS = 1.0
+TASK_BATCH_SIZE = 8
+TASK_MAX_FAILURES = max(1, int(os.getenv("TASK_MAX_FAILURES", "3")))
 
 
 app = FastAPI()
-reconcile_task = None
+project_scan_task = None
+task_consumer_task = None
+
+
+async def run_gitlab_call(func, *args):
+    return await asyncio.to_thread(func, *args)
 
 
 async def index_chunk_result(source_kind: str, chunk_result):
@@ -62,8 +77,23 @@ def format_ts(value):
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def normalize_branch_name(ref: str | None) -> str | None:
+    if not ref:
+        return None
+
+    branch_name = str(ref).strip()
+    if not branch_name:
+        return None
+
+    prefix = "refs/heads/"
+    if branch_name.startswith(prefix):
+        branch_name = branch_name[len(prefix) :]
+
+    return branch_name or None
+
+
 async def ensure_project_repo(gitlab, project_id: str):
-    repo_state = gitlab.get_repo_state(project_id)
+    repo_state = await run_gitlab_call(gitlab.get_repo_state, project_id)
     repo = await get_repo_async(repo_state["id"])
     if repo is None:
         last_activity_at = repo_state.get("last_activity_at") or EPOCH
@@ -75,43 +105,38 @@ async def ensure_project_repo(gitlab, project_id: str):
             "merge_requests_link": repo_state.get("merge_requests_link"),
             "left_activity_at": last_activity_at,
             "right_activity_at": last_activity_at,
+            "queued_left_activity_at": last_activity_at,
+            "queued_right_activity_at": last_activity_at,
         }
-        await ensure_repo_async(repo)
     else:
-        await ensure_repo_async(
-            {
-                "id": repo_state["id"],
-                "path": repo_state["path"],
-                "self_link": repo_state.get("self_link"),
-                "issues_link": repo_state.get("issues_link"),
-                "merge_requests_link": repo_state.get("merge_requests_link"),
-            }
-        )
-    return repo_state, repo
+        repo = {
+            "id": repo_state["id"],
+            "path": repo_state["path"],
+            "self_link": repo_state.get("self_link"),
+            "issues_link": repo_state.get("issues_link"),
+            "merge_requests_link": repo_state.get("merge_requests_link"),
+            "left_activity_at": repo["left_activity_at"],
+            "right_activity_at": repo["right_activity_at"],
+            "queued_left_activity_at": repo["queued_left_activity_at"],
+            "queued_right_activity_at": repo["queued_right_activity_at"],
+        }
+
+    await ensure_repo_async(repo)
+    current_repo = await get_repo_async(repo_state["id"])
+    return repo_state, current_repo or repo
 
 
 def build_modified_resources(events: list[dict[str, Any]]):
-    commit_pushes = []
-    commit_push_keys = set()
+    branches = set()
     issues = set()
     merge_requests = set()
 
     for event in events:
         push_data = event.get("push_data") or {}
-        commit_from = push_data.get("commit_from")
-        commit_to = push_data.get("commit_to")
-        if commit_to and commit_to != ZERO_SHA:
-            if commit_from == ZERO_SHA:
-                commit_from = None
-            key = (commit_from or "", commit_to)
-            if key not in commit_push_keys:
-                commit_push_keys.add(key)
-                commit_pushes.append(
-                    {
-                        "from_sha": commit_from,
-                        "to_sha": commit_to,
-                    }
-                )
+        if push_data.get("ref_type") == "branch":
+            branch_name = normalize_branch_name(push_data.get("ref"))
+            if branch_name is not None:
+                branches.add(branch_name)
 
         target_type = event.get("target_type")
         target_iid = event.get("target_iid")
@@ -136,111 +161,118 @@ def build_modified_resources(events: list[dict[str, Any]]):
             merge_requests.add(str(noteable_iid))
 
     return {
-        "commit_pushes": commit_pushes,
+        "branches": sorted(branches),
         "issues": sorted(issues, key=int),
         "merge_requests": sorted(merge_requests, key=int),
     }
 
 
 async def reconcile_issue_resource(gitlab, project_id: str, issue_iid: str):
-    issue = gitlab.get_issue_object(project_id, issue_iid)
+    issue = await run_gitlab_call(gitlab.get_issue_object, project_id, issue_iid)
     await upsert_issue_graph_async(issue)
     chunk_result = IssueChunkBuilder().build(issue)
     await index_chunk_result("issue", chunk_result)
+    logger.info(
+        "issue reconciled project_id=%s issue_iid=%s",
+        project_id,
+        issue.iid,
+    )
     return str(issue.iid)
 
 
 async def reconcile_merge_request_resource(
     gitlab, project_id: str, merge_request_iid: str
 ):
-    merge_request = gitlab.get_merge_request_object(
-        project_id, merge_request_iid
+    merge_request = await run_gitlab_call(
+        gitlab.get_merge_request_object,
+        project_id,
+        merge_request_iid,
     )
     await upsert_merge_request_graph_async(merge_request)
     chunk_result = MergeRequestChunkBuilder().build(merge_request)
     await index_chunk_result("merge_request", chunk_result)
+    logger.info(
+        "merge request reconciled project_id=%s merge_request_iid=%s",
+        project_id,
+        merge_request.iid,
+    )
     return str(merge_request.iid)
 
 
+async def reconcile_branch_resource(gitlab, project_id: str, branch_name: str):
+    repo_id = int(project_id)
+
+    try:
+        branch = await run_gitlab_call(gitlab.get_branch, project_id, branch_name)
+    except GitLabNotFoundError:
+        logger.warning(
+            "branch reconcile skipped project_id=%s branch=%s reason=not_found",
+            project_id,
+            branch_name,
+        )
+        await mark_branch_deleted_async(repo_id, branch_name)
+        return {
+            "branch": branch_name,
+            "head_sha": None,
+            "queued_commits": [],
+        }
+
+    head = branch.get("commit") or {}
+    head_sha = str(head.get("id") or "").strip()
+    if not head_sha:
+        raise ValueError(
+            f"branch {branch_name} in project {project_id} is missing head commit"
+        )
+
+    await upsert_branch_async(repo_id, branch_name, head_sha)
+    queued_commits = await enqueue_branch_missing_commits_async(
+        repo_id, branch_name
+    )
+    logger.info(
+        "branch reconciled project_id=%s branch=%s head_sha=%s queued_commit_count=%s",
+        project_id,
+        branch_name,
+        head_sha,
+        len(queued_commits),
+    )
+    return {
+        "branch": branch_name,
+        "head_sha": head_sha,
+        "queued_commits": queued_commits,
+    }
+
+
 async def reconcile_commit_resource(gitlab, project_id: str, sha: str):
-    commit = gitlab.get_commit_object(project_id, sha)
+    repo_id = int(project_id)
+
+    try:
+        commit = await run_gitlab_call(gitlab.get_commit_object, project_id, sha)
+    except GitLabNotFoundError:
+        logger.warning(
+            "commit reconcile skipped project_id=%s sha=%s reason=not_found",
+            project_id,
+            sha,
+        )
+        await upsert_commit_placeholder_async(repo_id, sha)
+        await mark_commit_indexed_async(repo_id, sha)
+        return None
+
     await upsert_commit_async(commit)
     chunk_result = CommitChunkBuilder().build(commit)
     await index_chunk_result("commit", chunk_result)
+    await mark_commit_indexed_async(commit.repo_id, commit.sha)
+    logger.info(
+        "commit reconciled project_id=%s sha=%s parent_count=%s",
+        project_id,
+        commit.sha,
+        len(commit.parent_shas),
+    )
+
+    for parent_sha in commit.parent_shas:
+        if await commit_needs_index_async(commit.repo_id, parent_sha):
+            await enqueue_task_async(commit.repo_id, "commit", parent_sha)
+
     return commit.sha
-
-
-async def reconcile_commit_push_resources(
-    gitlab, project_id: str, commit_pushes
-):
-    seen_commits = set()
-    reconciled_commits = []
-
-    for commit_push in commit_pushes:
-        from_sha = commit_push["from_sha"]
-        to_sha = commit_push["to_sha"]
-
-        shas = []
-        if from_sha:
-            compare = gitlab.compare_commits(project_id, from_sha, to_sha)
-            for commit in compare.get("commits") or []:
-                sha = str(commit.get("id") or "")
-                if sha:
-                    shas.append(sha)
-        elif to_sha:
-            shas.append(to_sha)
-
-        for sha in shas:
-            if sha in seen_commits:
-                continue
-            seen_commits.add(sha)
-            reconciled_commits.append(
-                await reconcile_commit_resource(gitlab, project_id, sha)
-            )
-
-    return reconciled_commits
-
-
-async def reconcile_issue_resources(gitlab, project_id: str, issues):
-    reconciled_issues = []
-
-    for issue_iid in issues:
-        reconciled_issues.append(
-            await reconcile_issue_resource(gitlab, project_id, issue_iid)
-        )
-
-    return reconciled_issues
-
-
-async def reconcile_merge_request_resources(
-    gitlab, project_id: str, merge_requests
-):
-    reconciled_merge_requests = []
-
-    for merge_request_iid in merge_requests:
-        reconciled_merge_requests.append(
-            await reconcile_merge_request_resource(
-                gitlab, project_id, merge_request_iid
-            )
-        )
-
-    return reconciled_merge_requests
-
-
-async def reconcile_modified_resources(
-    gitlab, project_id: str, modified_resources
-):
-    return {
-        "commit_pushes": await reconcile_commit_push_resources(
-            gitlab, project_id, modified_resources["commit_pushes"]
-        ),
-        "issues": await reconcile_issue_resources(
-            gitlab, project_id, modified_resources["issues"]
-        ),
-        "merge_requests": await reconcile_merge_request_resources(
-            gitlab, project_id, modified_resources["merge_requests"]
-        ),
-    }
 
 
 async def backfill_project_events(gitlab, project_id: str, left_activity_at):
@@ -256,10 +288,11 @@ async def backfill_project_events(gitlab, project_id: str, left_activity_at):
         if after_dt < epoch_dt:
             after_dt = epoch_dt
 
-        events = gitlab.list_project_events_window(
+        events = await run_gitlab_call(
+            gitlab.list_project_events_window,
             project_id,
-            after=format_ts(after_dt),
-            before=format_ts(left_dt),
+            format_ts(after_dt),
+            format_ts(left_dt),
         )
         if events:
             oldest = min(parse_ts(event["created_at"]) for event in events)
@@ -274,52 +307,71 @@ async def backfill_project_events(gitlab, project_id: str, left_activity_at):
 async def reconcile_project_id(gitlab, project_id: str):
     repo_state, previous_repo = await ensure_project_repo(gitlab, project_id)
 
-    new_events = gitlab.list_project_events_window(
+    new_events = await run_gitlab_call(
+        gitlab.list_project_events_window,
         project_id,
-        after=format_ts(previous_repo["right_activity_at"]),
+        format_ts(previous_repo["queued_right_activity_at"]),
     )
-    right_activity_at = previous_repo["right_activity_at"]
+    queued_right_activity_at = previous_repo["queued_right_activity_at"]
     if new_events:
         newest = max(parse_ts(event["created_at"]) for event in new_events)
-        right_activity_at = format_ts(newest)
+        queued_right_activity_at = format_ts(newest)
 
-    backfill_events, left_activity_at = await backfill_project_events(
+    backfill_events, queued_left_activity_at = await backfill_project_events(
         gitlab,
         project_id,
-        previous_repo["left_activity_at"],
+        previous_repo["queued_left_activity_at"],
     )
 
     events = new_events + backfill_events
     modified_resources = build_modified_resources(events)
-    reconciled = await reconcile_modified_resources(
-        gitlab, project_id, modified_resources
-    )
-    await update_repo_state_async(
-        {
-            "id": repo_state["id"],
-            "path": repo_state["path"],
-            "self_link": repo_state.get("self_link"),
-            "issues_link": repo_state.get("issues_link"),
-            "merge_requests_link": repo_state.get("merge_requests_link"),
-            "left_activity_at": left_activity_at,
-            "right_activity_at": right_activity_at,
-        }
+    if events:
+        remaining_task_count = await count_remaining_tasks_async(
+            repo_state["id"], TASK_MAX_FAILURES
+        )
+        logger.info(
+            "project task submission started project_id=%s remaining_task_count=%s branch_count=%s issue_count=%s merge_request_count=%s",
+            project_id,
+            remaining_task_count,
+            len(modified_resources["branches"]),
+            len(modified_resources["issues"]),
+            len(modified_resources["merge_requests"]),
+        )
+        await enqueue_project_tasks_async(
+            {
+                "id": repo_state["id"],
+                "path": repo_state["path"],
+                "self_link": repo_state.get("self_link"),
+                "issues_link": repo_state.get("issues_link"),
+                "merge_requests_link": repo_state.get("merge_requests_link"),
+                "left_activity_at": previous_repo["left_activity_at"],
+                "right_activity_at": previous_repo["right_activity_at"],
+                "queued_left_activity_at": queued_left_activity_at,
+                "queued_right_activity_at": queued_right_activity_at,
+            },
+            modified_resources,
+        )
+
+    activity_settled = await settle_repo_activity_async(
+        repo_state["id"], TASK_MAX_FAILURES
     )
 
     return {
         "project_id": project_id,
-        "repo_id": repo_state["id"],
-        "left_activity_at": left_activity_at,
-        "right_activity_at": right_activity_at,
         "event_count": len(events),
+        "queued_left_activity_at": queued_left_activity_at,
+        "queued_right_activity_at": queued_right_activity_at,
         "modified_resources": modified_resources,
-        "reconciled": reconciled,
+        "activity_settled": activity_settled,
     }
 
 
-async def reconcile_all_projects():
-    gitlab = GitLabClient()
-    projects = gitlab.list_projects()
+async def reconcile_all_projects(
+    gitlab: GitLabClient | None = None,
+):
+    gitlab = gitlab or GitLabClient()
+    projects = await run_gitlab_call(gitlab.list_projects)
+    logger.info("project scan started project_count=%s", len(projects))
     reconciled_projects = []
     failed_projects = []
 
@@ -341,45 +393,181 @@ async def reconcile_all_projects():
                 }
             )
 
-    return {
+    result = {
         "project_count": len(projects),
         "projects": reconciled_projects,
         "failed_projects": failed_projects,
     }
+    logger.info(
+        "project scan finished project_count=%s reconciled_count=%s failed_count=%s",
+        result["project_count"],
+        len(result["projects"]),
+        len(result["failed_projects"]),
+    )
+    return result
 
 
-async def reconcile_loop():
+async def process_task(gitlab, task: dict):
+    project_id = str(task["repo_id"])
+    task_kind = task["task_kind"]
+    task_key = task["task_key"]
+
+    if task_kind == "issue":
+        return await reconcile_issue_resource(gitlab, project_id, task_key)
+
+    if task_kind == "merge_request":
+        return await reconcile_merge_request_resource(
+            gitlab, project_id, task_key
+        )
+
+    if task_kind == "branch":
+        return await reconcile_branch_resource(gitlab, project_id, task_key)
+
+    if task_kind == "commit":
+        return await reconcile_commit_resource(gitlab, project_id, task_key)
+
+    raise ValueError(f"unsupported task kind: {task_kind}")
+
+
+async def claim_task_batch(limit: int = TASK_BATCH_SIZE):
+    claimed_tasks = []
+
+    for _ in range(limit):
+        task = await claim_task_async(TASK_MAX_FAILURES)
+        if task is None:
+            break
+
+        logger.info(
+            "task claimed task_id=%s project_id=%s task_kind=%s task_key=%s failure_count=%s",
+            task["id"],
+            task["repo_id"],
+            task["task_kind"],
+            task["task_key"],
+            task["failure_count"],
+        )
+        claimed_tasks.append(task)
+
+    return claimed_tasks
+
+
+async def process_claimed_task(gitlab, task: dict):
+    try:
+        result = await process_task(gitlab, task)
+    except Exception as exc:
+        logger.exception(
+            "task reconcile failed task_id=%s project_id=%s task_kind=%s task_key=%s",
+            task["id"],
+            task["repo_id"],
+            task["task_kind"],
+            task["task_key"],
+        )
+        failure = await fail_task_async(
+            task["id"],
+            str(exc),
+            TASK_MAX_FAILURES,
+        )
+        await settle_repo_activity_async(task["repo_id"], TASK_MAX_FAILURES)
+        return {
+            "task_id": task["id"],
+            "project_id": task["repo_id"],
+            "task_kind": task["task_kind"],
+            "task_key": task["task_key"],
+            "status": failure["status"] if failure is not None else "pending",
+            "failure_count": failure["failure_count"]
+            if failure is not None
+            else None,
+            "error": str(exc),
+        }
+
+    await complete_task_async(task["id"])
+    await settle_repo_activity_async(task["repo_id"], TASK_MAX_FAILURES)
+    logger.info(
+        "task completed task_id=%s project_id=%s task_kind=%s task_key=%s",
+        task["id"],
+        task["repo_id"],
+        task["task_kind"],
+        task["task_key"],
+    )
+    return {
+        "task_id": task["id"],
+        "project_id": task["repo_id"],
+        "task_kind": task["task_kind"],
+        "task_key": task["task_key"],
+        "status": "done",
+        "result": result,
+    }
+
+
+async def process_task_batch(gitlab, limit: int = TASK_BATCH_SIZE):
+    claimed_tasks = await claim_task_batch(limit)
+    if not claimed_tasks:
+        return []
+
+    logger.info("task batch started task_count=%s", len(claimed_tasks))
+    processed = await asyncio.gather(
+        *(process_claimed_task(gitlab, task) for task in claimed_tasks)
+    )
+    logger.info("task batch finished task_count=%s", len(processed))
+    return list(processed)
+
+
+async def project_scan_loop():
+    gitlab = GitLabClient()
+
     while True:
         try:
-            await reconcile_all_projects()
+            await reconcile_all_projects(gitlab)
         except Exception:
-            logger.exception("reconcile loop iteration failed")
+            logger.exception("project scan iteration failed")
 
         await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
 
 
+async def task_consumer_loop():
+    gitlab = GitLabClient()
+
+    while True:
+        try:
+            processed_tasks = await process_task_batch(gitlab)
+        except Exception:
+            logger.exception("task batch iteration failed")
+            processed_tasks = []
+
+        if processed_tasks:
+            continue
+        await asyncio.sleep(TASK_IDLE_SECONDS)
+
+
 @app.on_event("startup")
 async def startup():
-    global reconcile_task
+    global project_scan_task, task_consumer_task
 
     await init_db_async()
-    start_consumer()
-    if reconcile_task is None or reconcile_task.done():
-        reconcile_task = asyncio.create_task(reconcile_loop())
+    if project_scan_task is None or project_scan_task.done():
+        project_scan_task = asyncio.create_task(project_scan_loop())
+    if task_consumer_task is None or task_consumer_task.done():
+        task_consumer_task = asyncio.create_task(task_consumer_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global reconcile_task
+    global project_scan_task, task_consumer_task
 
-    await stop_consumer()
-    if reconcile_task is not None:
-        reconcile_task.cancel()
+    if project_scan_task is not None:
+        project_scan_task.cancel()
         try:
-            await reconcile_task
+            await project_scan_task
         except asyncio.CancelledError:
             pass
-        reconcile_task = None
+        project_scan_task = None
+
+    if task_consumer_task is not None:
+        task_consumer_task.cancel()
+        try:
+            await task_consumer_task
+        except asyncio.CancelledError:
+            pass
+        task_consumer_task = None
 
 
 @app.get("/health")
@@ -389,9 +577,11 @@ def health():
 
 @app.post("/reconcile/projects")
 async def reconcile_projects():
-    result = await reconcile_all_projects()
-    result["ok"] = True
-    return result
+    gitlab = GitLabClient()
+    queued = await reconcile_all_projects(gitlab)
+    queued["processed_tasks"] = await process_task_batch(gitlab)
+    queued["ok"] = True
+    return queued
 
 
 @app.post("/search")

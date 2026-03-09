@@ -1,16 +1,39 @@
-import { useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { searchContent, type SearchResult } from "./utils";
 import "./styles.css";
 
 const PAGE_SIZE = 10;
+const CONTENT_CHAR_LIMIT = 600;
+const CONTENT_LINE_LIMIT = 12;
 
 function formatScore(score: number | null) {
   if (score === null) {
-    return "";
+    return "-";
   }
 
   return score.toFixed(3);
+}
+
+function resultKey(result: SearchResult) {
+  return [
+    result.project_id,
+    result.source_kind,
+    result.source_key,
+    result.chunk_index,
+  ].join(":");
+}
+
+function isLargeContent(content: string) {
+  return (
+    content.length > CONTENT_CHAR_LIMIT ||
+    content.split(/\r?\n/).length > CONTENT_LINE_LIMIT
+  );
+}
+
+function resizeTextarea(element: HTMLTextAreaElement) {
+  element.style.height = "auto";
+  element.style.height = `${element.scrollHeight}px`;
 }
 
 function SearchPage() {
@@ -20,28 +43,27 @@ function SearchPage() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const hasNextPage = results.length === PAGE_SIZE;
-  const summary = useMemo(() => {
-    if (!query) {
-      return "Search GitLab facts.";
-    }
 
-    if (loading) {
-      return `Searching page ${page}...`;
+  useEffect(() => {
+    if (textareaRef.current) {
+      resizeTextarea(textareaRef.current);
     }
-
-    return `${results.length} results on page ${page}.`;
-  }, [loading, page, query, results.length]);
+  }, [draft]);
 
   async function runSearch(nextQuery: string, nextPage: number) {
     setLoading(true);
     setError("");
+    setQuery(nextQuery);
+    setPage(nextPage);
+    setResults([]);
+    setExpandedRows({});
 
     try {
       const nextResults = await searchContent(nextQuery, nextPage, PAGE_SIZE);
-      setQuery(nextQuery);
-      setPage(nextPage);
       setResults(nextResults);
     } catch (err) {
       setError(err instanceof Error ? err.message : "search failed");
@@ -53,8 +75,10 @@ function SearchPage() {
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nextQuery = draft.trim();
+
     if (!nextQuery) {
-      setError("Enter search text.");
+      setError("enter search text");
+      setResults([]);
       return;
     }
 
@@ -69,94 +93,135 @@ function SearchPage() {
     void runSearch(query, nextPage);
   }
 
+  function toggleExpanded(rowKey: string) {
+    setExpandedRows((current) => ({
+      ...current,
+      [rowKey]: !current[rowKey],
+    }));
+  }
+
   return (
-    <main className="page">
-      <section className="hero">
-        <p className="eyebrow">Wissen Lab</p>
-        <h1>Search GitLab facts</h1>
-        <p className="lede">
-          Issues, merge requests, commits. One box. Source links included.
-        </p>
-      </section>
+    <main className="wissen">
+      <h1 className="title">WissenLab GitLab embedding search</h1>
 
-      <section className="panel">
-        <form className="searchbar" onSubmit={onSubmit}>
-          <textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            rows={4}
-          />
-          <div className="actions">
-            <button type="submit" disabled={loading}>
-              {loading ? "Searching..." : "Search"}
-            </button>
-          </div>
-        </form>
+      <form className="query-line" onSubmit={onSubmit}>
+        <textarea
+          id="search-query"
+          ref={textareaRef}
+          className="query-input query-textarea"
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            resizeTextarea(event.target);
+          }}
+          rows={1}
+          spellCheck={false}
+          aria-label="Search query"
+        />
+        <button type="submit" disabled={loading}>
+          {loading ? "searching" : "search"}
+        </button>
+      </form>
 
-        <div className="statusline">
-          <span>{summary}</span>
-          {error ? <span className="error">{error}</span> : null}
-        </div>
+      <div className="results-scroll">
+        <table className="result-table">
+          <colgroup>
+            <col className="col-project" />
+            <col className="col-source" />
+            <col className="col-content" />
+            <col className="col-score" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th scope="col">project</th>
+              <th scope="col">source</th>
+              <th scope="col">content</th>
+              <th scope="col">score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {error ? (
+              <tr className="message-row">
+                <td className="error-cell" colSpan={4}>
+                  {error}
+                </td>
+              </tr>
+            ) : results.length > 0 ? (
+              results.map((result) => {
+                const rowKey = resultKey(result);
+                const contentIsLarge = isLargeContent(result.content);
+                const isExpanded = Boolean(expandedRows[rowKey]);
 
-        <div className="results">
-          {results.map((result) => (
-            <article className="result" key={resultKey(result)}>
-              <div className="resulthead">
-                <div>
-                  <strong>{result.repo_path}</strong>
-                  <span className="kind">
-                    {result.source_kind} #{result.source_key}
-                  </span>
-                </div>
-                <div className="meta">
-                  {result.score !== null ? (
-                    <span>score {formatScore(result.score)}</span>
-                  ) : null}
-                  {result.url ? (
-                    <a href={result.url} target="_blank" rel="noreferrer">
-                      open
-                    </a>
-                  ) : null}
-                </div>
-              </div>
-              <p>{result.content}</p>
-            </article>
-          ))}
+                return (
+                  <tr key={rowKey}>
+                    <td className="project-cell">
+                      <strong>{result.project_path}</strong>
+                    </td>
+                    <td className="source-cell">
+                      <strong>{result.source_kind}</strong>
+                      <span>#{result.source_key}</span>
+                      {result.locator_id ? (
+                        <span>locator {result.locator_id}</span>
+                      ) : null}
+                    </td>
+                    <td className="content-cell">
+                      <pre
+                        className={
+                          contentIsLarge && !isExpanded ? "content-preview" : ""
+                        }
+                      >
+                        {result.content}
+                      </pre>
+                      {contentIsLarge ? (
+                        <button
+                          type="button"
+                          className="content-toggle"
+                          onClick={() => toggleExpanded(rowKey)}
+                        >
+                          {isExpanded ? "hide" : "expand"}
+                        </button>
+                      ) : null}
+                    </td>
+                    <td className="score-cell">
+                      {result.url ? (
+                        <a href={result.url} target="_blank" rel="noreferrer">
+                          {formatScore(result.score)}
+                        </a>
+                      ) : (
+                        formatScore(result.score)
+                      )}
+                    </td>
+                  </tr>
+                );
+              })
+            ) : query && !loading ? (
+              <tr className="message-row">
+                <td colSpan={4}>no results.</td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
 
-          {!loading && query && results.length === 0 ? (
-            <div className="empty">No results.</div>
-          ) : null}
-        </div>
-
-        <div className="pager">
-          <button
-            type="button"
-            onClick={() => openPage(page - 1)}
-            disabled={loading || page <= 1}
-          >
-            Previous
-          </button>
-          <span>Page {page}</span>
-          <button
-            type="button"
-            onClick={() => openPage(page + 1)}
-            disabled={loading || !hasNextPage}
-          >
-            Next
-          </button>
-        </div>
-      </section>
+      <div className="pager">
+        <button
+          type="button"
+          onClick={() => openPage(page - 1)}
+          disabled={loading || page <= 1}
+        >
+          prev
+        </button>
+        <span>page {page}</span>
+        <button
+          type="button"
+          onClick={() => openPage(page + 1)}
+          disabled={loading || !hasNextPage}
+        >
+          next
+        </button>
+      </div>
     </main>
   );
-}
-
-function resultKey(result: SearchResult) {
-  return [
-    result.repo_id,
-    result.source_kind,
-    result.source_key,
-    result.chunk_index,
-  ].join(":");
 }
 
 export default SearchPage;

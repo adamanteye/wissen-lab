@@ -119,6 +119,7 @@ class Commit:
     sha: str
     message: str = ""
     url: str | None = None
+    parent_shas: list[str] = field(default_factory=list)
     diffs: list[CommitDiff] = field(default_factory=list)
 
     @classmethod
@@ -146,6 +147,11 @@ class Commit:
             sha=str(commit["id"]),
             message=(commit.get("message") or "").strip(),
             url=url,
+            parent_shas=[
+                str(parent_sha)
+                for parent_sha in commit.get("parent_ids") or []
+                if parent_sha
+            ],
             diffs=commit_diffs,
         )
 

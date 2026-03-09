@@ -21,7 +21,8 @@ GitLab fact indexer.
 - `GITLAB_API_TOKEN`: GitLab API token.
 - `LLAMA_SERVER_URL`: llama-server URL.
 - `LLAMA_SERVER_API_KEY`: llama-server API key.
-- `LLAMA_SERVER_MIN_INTERVAL_SECONDS`: Min seconds between embedding requests.
+- `LLAMA_SERVER_TIMEOUT_SECONDS`: Timeout for each embedding request. Default `30`.
+- `TASK_MAX_FAILURES`: Max task failures before the reconciler treats the task as settled and advances project activity windows. Default `3`.
 - `BATCH_SIZE_LIMIT`: Max chars per chunk before split. Default `8192`.
 
 ## `/search` Example Response
@@ -43,8 +44,8 @@ Each result has `url` and `content`.
 ```json
 [
   {
-    "repo_id": 6,
-    "repo_path": "infra/wissen-lab",
+    "project_id": 6,
+    "project_path": "infra/wissen-lab",
     "source_kind": "issue",
     "source_key": "42",
     "chunk_index": 0,
@@ -54,8 +55,8 @@ Each result has `url` and `content`.
     "score": 0.9134
   },
   {
-    "repo_id": 6,
-    "repo_path": "infra/wissen-lab",
+    "project_id": 6,
+    "project_path": "infra/wissen-lab",
     "source_kind": "merge_request",
     "source_key": "17",
     "chunk_index": 2,
@@ -65,8 +66,8 @@ Each result has `url` and `content`.
     "score": 0.8871
   },
   {
-    "repo_id": 6,
-    "repo_path": "infra/wissen-lab",
+    "project_id": 6,
+    "project_path": "infra/wissen-lab",
     "source_kind": "commit",
     "source_key": "367610302658f4288181a346a4b509e2eda69ede",
     "chunk_index": 0,
