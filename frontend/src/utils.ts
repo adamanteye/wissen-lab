@@ -24,7 +24,6 @@ export async function searchContent(
       content,
       page,
       page_size: pageSize,
-      top_k: pageSize,
     }),
   });
 

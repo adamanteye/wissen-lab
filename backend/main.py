@@ -600,18 +600,6 @@ async def search(request: Request):
         raise HTTPException(status_code=400, detail="content is required")
 
     try:
-        top_k = int(payload.get("top_k", 10))
-    except (TypeError, ValueError) as exc:
-        logger.warning("search returned status=400 reason=invalid_top_k")
-        raise HTTPException(
-            status_code=400, detail="top_k must be an integer"
-        ) from exc
-
-    if top_k < 1:
-        logger.warning("search returned status=400 reason=top_k_lt_1")
-        raise HTTPException(status_code=400, detail="top_k must be >= 1")
-
-    try:
         page = int(payload.get("page", 1))
     except (TypeError, ValueError) as exc:
         logger.warning("search returned status=400 reason=invalid_page")
@@ -625,7 +613,7 @@ async def search(request: Request):
         raise HTTPException(status_code=400, detail="page must be >= 1")
 
     try:
-        page_size = int(payload.get("page_size", top_k))
+        page_size = int(payload.get("page_size", 10))
     except (TypeError, ValueError) as exc:
         logger.warning("search returned status=400 reason=invalid_page_size")
         raise HTTPException(
@@ -640,7 +628,6 @@ async def search(request: Request):
             detail="page_size must be >= 1",
         )
 
-    top_k = min(top_k, 50)
     page_size = min(page_size, 50)
     offset = (page - 1) * page_size
 
@@ -648,13 +635,12 @@ async def search(request: Request):
         embedding = await embed_search_text(content)
         results = await search_embeddings_async(
             embedding,
-            min(top_k, page_size),
+            page_size,
             offset,
         )
     except Exception as exc:
         logger.exception(
-            "search returned status=500 reason=backend_failure top_k=%s page=%s page_size=%s",
-            top_k,
+            "search returned status=500 reason=backend_failure page=%s page_size=%s",
             page,
             page_size,
         )
