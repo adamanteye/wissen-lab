@@ -6,6 +6,7 @@ import "./styles.css";
 const PAGE_SIZE = 10;
 const CONTENT_CHAR_LIMIT = 600;
 const CONTENT_LINE_LIMIT = 12;
+const COMMIT_SHA_DISPLAY_LENGTH = 8;
 
 function formatScore(score: number | null) {
   if (score === null) {
@@ -22,6 +23,14 @@ function resultKey(result: SearchResult) {
     result.source_key,
     result.chunk_index,
   ].join(":");
+}
+
+function formatSourceKey(result: SearchResult) {
+  if (result.source_kind !== "commit") {
+    return result.source_key;
+  }
+
+  return result.source_key.slice(0, COMMIT_SHA_DISPLAY_LENGTH);
 }
 
 function isLargeContent(content: string) {
@@ -159,7 +168,9 @@ function SearchPage() {
                     </td>
                     <td className="source-cell">
                       <strong>{result.source_kind}</strong>
-                      <span>#{result.source_key}</span>
+                      <span title={result.source_key}>
+                        #{formatSourceKey(result)}
+                      </span>
                       {result.locator_id ? (
                         <span>locator {result.locator_id}</span>
                       ) : null}
