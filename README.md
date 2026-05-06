@@ -35,7 +35,7 @@ curl -X POST http://localhost:8000/search \
   --data '{
     "content": "mail notification config",
     "page": 1,
-    "page_size": 10
+    "page_size": 30
   }'
 ```
 

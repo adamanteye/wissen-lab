@@ -43,6 +43,7 @@ RECONCILE_INTERVAL_SECONDS = 300
 TASK_IDLE_SECONDS = 1.0
 TASK_BATCH_SIZE = 8
 TASK_MAX_FAILURES = max(1, int(os.getenv("TASK_MAX_FAILURES", "3")))
+SEARCH_MAX_PAGE_SIZE = 100
 
 
 app = FastAPI()
@@ -168,7 +169,9 @@ def build_modified_resources(events: list[dict[str, Any]]):
 
 
 async def reconcile_issue_resource(gitlab, project_id: str, issue_iid: str):
-    issue = await run_gitlab_call(gitlab.get_issue_object, project_id, issue_iid)
+    issue = await run_gitlab_call(
+        gitlab.get_issue_object, project_id, issue_iid
+    )
     await upsert_issue_graph_async(issue)
     chunk_result = IssueChunkBuilder().build(issue)
     await index_chunk_result("issue", chunk_result)
@@ -203,7 +206,9 @@ async def reconcile_branch_resource(gitlab, project_id: str, branch_name: str):
     repo_id = int(project_id)
 
     try:
-        branch = await run_gitlab_call(gitlab.get_branch, project_id, branch_name)
+        branch = await run_gitlab_call(
+            gitlab.get_branch, project_id, branch_name
+        )
     except GitLabNotFoundError:
         logger.warning(
             "branch reconcile skipped project_id=%s branch=%s reason=not_found",
@@ -246,7 +251,9 @@ async def reconcile_commit_resource(gitlab, project_id: str, sha: str):
     repo_id = int(project_id)
 
     try:
-        commit = await run_gitlab_call(gitlab.get_commit_object, project_id, sha)
+        commit = await run_gitlab_call(
+            gitlab.get_commit_object, project_id, sha
+        )
     except GitLabNotFoundError:
         logger.warning(
             "commit reconcile skipped project_id=%s sha=%s reason=not_found",
@@ -612,8 +619,12 @@ async def search(request: Request):
         logger.warning("search returned status=400 reason=page_lt_1")
         raise HTTPException(status_code=400, detail="page must be >= 1")
 
+    if "page_size" not in payload:
+        logger.warning("search returned status=400 reason=missing_page_size")
+        raise HTTPException(status_code=400, detail="page_size is required")
+
     try:
-        page_size = int(payload.get("page_size", 10))
+        page_size = int(payload["page_size"])
     except (TypeError, ValueError) as exc:
         logger.warning("search returned status=400 reason=invalid_page_size")
         raise HTTPException(
@@ -628,7 +639,7 @@ async def search(request: Request):
             detail="page_size must be >= 1",
         )
 
-    page_size = min(page_size, 50)
+    page_size = min(page_size, SEARCH_MAX_PAGE_SIZE)
     offset = (page - 1) * page_size
 
     try:

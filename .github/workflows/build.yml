@@ -1,0 +1,25 @@
+name: Build and Push Docker Image
+run-name: Build and Push ${{ github.ref_name }}
+on:
+  push:
+    branches-ignore:
+      - "master"
+    paths-ignore:
+      - "README.md"
+jobs:
+  call-docker-build:
+    strategy:
+      matrix:
+        include:
+          - name: wissenfront
+            path: frontend
+          - name: wissenlab
+            path: backend
+    permissions:
+      contents: read
+      packages: write
+    uses: adamanteye/actions/.github/workflows/docker.yml@master
+    with:
+      name: ${{ matrix.name }}
+      owner: ${{ github.repository_owner }}
+      path: ${{ matrix.path }}

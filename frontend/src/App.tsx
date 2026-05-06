@@ -3,7 +3,7 @@ import type { FormEvent } from "react";
 import { searchContent, type SearchResult } from "./utils";
 import "./styles.css";
 
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 30;
 const CONTENT_CHAR_LIMIT = 600;
 const CONTENT_LINE_LIMIT = 12;
 const COMMIT_SHA_DISPLAY_LENGTH = 8;

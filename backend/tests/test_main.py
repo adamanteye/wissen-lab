@@ -219,9 +219,7 @@ class ReconcileResourceTests(IsolatedAsyncioTestCase):
             result,
         )
         upsert_branch_async.assert_awaited_once_with(2, "main", "head-sha")
-        enqueue_branch_missing_commits_async.assert_awaited_once_with(
-            2, "main"
-        )
+        enqueue_branch_missing_commits_async.assert_awaited_once_with(2, "main")
 
     async def test_reconcile_branch_resource_marks_deleted_branch(self):
         gitlab = Mock()
@@ -256,6 +254,69 @@ class ReconcileResourceTests(IsolatedAsyncioTestCase):
             result,
         )
         mark_branch_deleted_async.assert_awaited_once_with(2, "main")
+
+
+class JsonRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
+
+
+class SearchEndpointTests(IsolatedAsyncioTestCase):
+    async def test_search_requires_page_size(self):
+        request = JsonRequest({"content": "mail config", "page": 1})
+
+        with self.assertRaises(main.HTTPException) as exc:
+            await main.search(request)
+
+        self.assertEqual(400, exc.exception.status_code)
+        self.assertEqual("page_size is required", exc.exception.detail)
+
+    async def test_search_passes_frontend_page_size_to_database(self):
+        request = JsonRequest(
+            {"content": "mail config", "page": 3, "page_size": 30}
+        )
+
+        with (
+            patch.object(
+                main,
+                "embed_search_text",
+                new=AsyncMock(return_value=[0.1, 0.2]),
+            ) as embed_search_text,
+            patch.object(
+                main,
+                "search_embeddings_async",
+                new=AsyncMock(return_value=[{"content": "result"}]),
+            ) as search_embeddings_async,
+        ):
+            result = await main.search(request)
+
+        self.assertEqual([{"content": "result"}], result)
+        embed_search_text.assert_awaited_once_with("mail config")
+        search_embeddings_async.assert_awaited_once_with([0.1, 0.2], 30, 60)
+
+    async def test_search_caps_page_size_at_maximum(self):
+        request = JsonRequest(
+            {"content": "mail config", "page": 2, "page_size": 120}
+        )
+
+        with (
+            patch.object(
+                main,
+                "embed_search_text",
+                new=AsyncMock(return_value=[0.1, 0.2]),
+            ),
+            patch.object(
+                main,
+                "search_embeddings_async",
+                new=AsyncMock(return_value=[]),
+            ) as search_embeddings_async,
+        ):
+            await main.search(request)
+
+        search_embeddings_async.assert_awaited_once_with([0.1, 0.2], 100, 100)
 
 
 class TaskConsumerTests(IsolatedAsyncioTestCase):
