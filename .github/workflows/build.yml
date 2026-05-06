@@ -2,10 +2,8 @@ name: Build and Push Docker Image
 run-name: Build and Push ${{ github.ref_name }}
 on:
   push:
-    branches-ignore:
-      - "master"
-    paths-ignore:
-      - "README.md"
+    tags:
+      - '*.*.*'
 jobs:
   call-docker-build:
     strategy:
