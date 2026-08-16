@@ -108,6 +108,7 @@ async def ensure_project_repo(gitlab, project_id: str):
             "right_activity_at": last_activity_at,
             "queued_left_activity_at": last_activity_at,
             "queued_right_activity_at": last_activity_at,
+            "bootstrapped_at": None,
         }
     else:
         repo = {
@@ -120,6 +121,7 @@ async def ensure_project_repo(gitlab, project_id: str):
             "right_activity_at": repo["right_activity_at"],
             "queued_left_activity_at": repo["queued_left_activity_at"],
             "queued_right_activity_at": repo["queued_right_activity_at"],
+            "bootstrapped_at": repo.get("bootstrapped_at"),
         }
 
     await ensure_repo_async(repo)
@@ -313,6 +315,7 @@ async def backfill_project_events(gitlab, project_id: str, left_activity_at):
 
 async def reconcile_project_id(gitlab, project_id: str):
     repo_state, previous_repo = await ensure_project_repo(gitlab, project_id)
+    needs_bootstrap = previous_repo.get("bootstrapped_at") is None
 
     new_events = await run_gitlab_call(
         gitlab.list_project_events_window,
@@ -332,14 +335,30 @@ async def reconcile_project_id(gitlab, project_id: str):
 
     events = new_events + backfill_events
     modified_resources = build_modified_resources(events)
-    if events:
+    if needs_bootstrap:
+        inventory = await run_gitlab_call(
+            gitlab.get_project_inventory,
+            project_id,
+        )
+        for resource_kind, values in inventory.items():
+            combined = set(modified_resources[resource_kind])
+            combined.update(values)
+            modified_resources[resource_kind] = sorted(
+                combined,
+                key=int
+                if resource_kind in {"issues", "merge_requests"}
+                else None,
+            )
+
+    if events or needs_bootstrap:
         remaining_task_count = await count_remaining_tasks_async(
             repo_state["id"], TASK_MAX_FAILURES
         )
         logger.info(
-            "project task submission started project_id=%s remaining_task_count=%s branch_count=%s issue_count=%s merge_request_count=%s",
+            "project task submission started project_id=%s remaining_task_count=%s bootstrap=%s branch_count=%s issue_count=%s merge_request_count=%s",
             project_id,
             remaining_task_count,
+            needs_bootstrap,
             len(modified_resources["branches"]),
             len(modified_resources["issues"]),
             len(modified_resources["merge_requests"]),
@@ -355,8 +374,10 @@ async def reconcile_project_id(gitlab, project_id: str):
                 "right_activity_at": previous_repo["right_activity_at"],
                 "queued_left_activity_at": queued_left_activity_at,
                 "queued_right_activity_at": queued_right_activity_at,
+                "bootstrapped_at": previous_repo.get("bootstrapped_at"),
             },
             modified_resources,
+            needs_bootstrap,
         )
 
     activity_settled = await settle_repo_activity_async(
@@ -369,6 +390,7 @@ async def reconcile_project_id(gitlab, project_id: str):
         "queued_left_activity_at": queued_left_activity_at,
         "queued_right_activity_at": queued_right_activity_at,
         "modified_resources": modified_resources,
+        "bootstrapped": needs_bootstrap,
         "activity_settled": activity_settled,
     }
 
@@ -589,6 +611,21 @@ async def reconcile_projects():
     queued["processed_tasks"] = await process_task_batch(gitlab)
     queued["ok"] = True
     return queued
+
+
+@app.post("/reconcile/projects/{project_id}")
+async def reconcile_project(project_id: int):
+    if project_id < 1:
+        raise HTTPException(status_code=400, detail="project_id must be >= 1")
+
+    gitlab = GitLabClient()
+    try:
+        reconciled = await reconcile_project_id(gitlab, str(project_id))
+    except GitLabNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="project not found") from exc
+
+    reconciled["ok"] = True
+    return reconciled
 
 
 @app.post("/search")

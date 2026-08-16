@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -36,11 +37,54 @@ class GitLabClient:
         return self._get_all(
             "/api/v4/projects",
             params={
-                "order_by": "id",
-                "sort": "asc",
+                "order_by": "last_activity_at",
+                "sort": "desc",
                 "per_page": 100,
             },
         )
+
+    def get_project_inventory(self, project_id: str | int) -> dict:
+        project = self.get_project(project_id)
+        encoded_project_id = quote(str(project["id"]), safe="")
+        branches = self._get_all(
+            f"/api/v4/projects/{encoded_project_id}/repository/branches",
+            params={"per_page": 100},
+        )
+        issues = self._get_all(
+            f"/api/v4/projects/{encoded_project_id}/issues",
+            params={
+                "scope": "all",
+                "state": "all",
+                "per_page": 100,
+            },
+        )
+        merge_requests = self._get_all(
+            f"/api/v4/projects/{encoded_project_id}/merge_requests",
+            params={
+                "scope": "all",
+                "state": "all",
+                "per_page": 100,
+            },
+        )
+        return {
+            "branches": sorted(
+                str(branch["name"])
+                for branch in branches
+                if branch.get("name")
+            ),
+            "issues": sorted(
+                (str(issue["iid"]) for issue in issues if issue.get("iid")),
+                key=int,
+            ),
+            "merge_requests": sorted(
+                (
+                    str(merge_request["iid"])
+                    for merge_request in merge_requests
+                    if merge_request.get("iid")
+                ),
+                key=int,
+            ),
+        }
 
     def get_issue(self, project_id: str | int, issue_iid: str | int) -> dict:
         path = (
@@ -172,15 +216,64 @@ class GitLabClient:
         before: str | None = None,
     ) -> list[dict]:
         project = self.get_project(project_id)
-        return self._get_all(
+        after_dt = self._parse_event_timestamp(after)
+        before_dt = self._parse_event_timestamp(before)
+
+        # GitLab's Events API exposes date-granularity bounds. Widen the API
+        # request around each exact cursor, then apply the timestamp bounds
+        # locally so events later on the cursor's calendar day are not lost.
+        api_after = (
+            (after_dt - timedelta(days=1)).date().isoformat()
+            if after_dt is not None
+            else None
+        )
+        api_before = (
+            (before_dt + timedelta(days=1)).date().isoformat()
+            if before_dt is not None
+            else None
+        )
+        events = self._get_all(
             f"/api/v4/projects/{quote(str(project['id']), safe='')}/events",
             params={
-                "after": after,
-                "before": before,
+                "after": api_after,
+                "before": api_before,
                 "sort": "asc",
                 "per_page": 100,
             },
         )
+        return [
+            event
+            for event in events
+            if self._event_is_in_window(event, after_dt, before_dt)
+        ]
+
+    @staticmethod
+    def _parse_event_timestamp(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _event_is_in_window(
+        cls,
+        event: dict,
+        after: datetime | None,
+        before: datetime | None,
+    ) -> bool:
+        created_at = cls._parse_event_timestamp(event.get("created_at"))
+        if created_at is None:
+            return False
+        if after is not None and created_at <= after:
+            return False
+        if before is not None and created_at >= before:
+            return False
+        return True
 
     def get_repo_state(self, project_id: str | int) -> dict:
         project = self.get_project(project_id)

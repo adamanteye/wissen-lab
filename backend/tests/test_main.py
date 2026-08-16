@@ -149,6 +149,148 @@ class ModifiedResourceTests(TestCase):
         self.assertEqual(["11"], resources["merge_requests"])
 
 
+class ReconcileProjectTests(IsolatedAsyncioTestCase):
+    async def test_unbootstrapped_repo_enqueues_full_inventory(self):
+        gitlab = Mock()
+        gitlab.list_project_events_window.return_value = []
+        gitlab.get_project_inventory.return_value = {
+            "branches": ["main", "topic"],
+            "issues": ["2", "12"],
+            "merge_requests": ["3"],
+        }
+        repo_state = {
+            "id": 451,
+            "path": "group/project",
+            "self_link": "https://gitlab.example.com/api/v4/projects/451",
+            "issues_link": None,
+            "merge_requests_link": None,
+        }
+        previous_repo = {
+            **repo_state,
+            "left_activity_at": main.EPOCH,
+            "right_activity_at": main.EPOCH,
+            "queued_left_activity_at": main.EPOCH,
+            "queued_right_activity_at": main.EPOCH,
+            "bootstrapped_at": None,
+        }
+
+        with (
+            patch.object(
+                main,
+                "run_gitlab_call",
+                new=direct_gitlab_call,
+            ),
+            patch.object(
+                main,
+                "ensure_project_repo",
+                new=AsyncMock(return_value=(repo_state, previous_repo)),
+            ),
+            patch.object(
+                main,
+                "enqueue_project_tasks_async",
+                new=AsyncMock(),
+            ) as enqueue_project_tasks_async,
+            patch.object(
+                main,
+                "settle_repo_activity_async",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            result = await main.reconcile_project_id(gitlab, "451")
+
+        self.assertTrue(result["bootstrapped"])
+        self.assertEqual(
+            {
+                "branches": ["main", "topic"],
+                "issues": ["2", "12"],
+                "merge_requests": ["3"],
+            },
+            result["modified_resources"],
+        )
+        gitlab.get_project_inventory.assert_called_once_with("451")
+        enqueue_args = enqueue_project_tasks_async.await_args.args
+        self.assertEqual(451, enqueue_args[0]["id"])
+        self.assertEqual(result["modified_resources"], enqueue_args[1])
+        self.assertTrue(enqueue_args[2])
+
+    async def test_bootstrapped_repo_does_not_reload_inventory(self):
+        gitlab = Mock()
+        gitlab.list_project_events_window.return_value = []
+        repo_state = {"id": 451, "path": "group/project"}
+        previous_repo = {
+            **repo_state,
+            "left_activity_at": main.EPOCH,
+            "right_activity_at": main.EPOCH,
+            "queued_left_activity_at": main.EPOCH,
+            "queued_right_activity_at": main.EPOCH,
+            "bootstrapped_at": "2026-08-16T10:00:00Z",
+        }
+
+        with (
+            patch.object(
+                main,
+                "run_gitlab_call",
+                new=direct_gitlab_call,
+            ),
+            patch.object(
+                main,
+                "ensure_project_repo",
+                new=AsyncMock(return_value=(repo_state, previous_repo)),
+            ),
+            patch.object(
+                main,
+                "enqueue_project_tasks_async",
+                new=AsyncMock(),
+            ) as enqueue_project_tasks_async,
+            patch.object(
+                main,
+                "settle_repo_activity_async",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            result = await main.reconcile_project_id(gitlab, "451")
+
+        self.assertFalse(result["bootstrapped"])
+        gitlab.get_project_inventory.assert_not_called()
+        enqueue_project_tasks_async.assert_not_awaited()
+
+
+class ReconcileProjectEndpointTests(IsolatedAsyncioTestCase):
+    async def test_reconcile_project_runs_only_requested_project(self):
+        gitlab = Mock()
+
+        with (
+            patch.object(main, "GitLabClient", return_value=gitlab),
+            patch.object(
+                main,
+                "reconcile_project_id",
+                new=AsyncMock(
+                    return_value={
+                        "project_id": "451",
+                        "event_count": 2,
+                    }
+                ),
+            ) as reconcile_project_id,
+        ):
+            result = await main.reconcile_project(451)
+
+        reconcile_project_id.assert_awaited_once_with(gitlab, "451")
+        self.assertEqual(
+            {
+                "project_id": "451",
+                "event_count": 2,
+                "ok": True,
+            },
+            result,
+        )
+
+    async def test_reconcile_project_rejects_non_positive_id(self):
+        with self.assertRaises(HTTPException) as raised:
+            await main.reconcile_project(0)
+
+        self.assertEqual(400, raised.exception.status_code)
+
+
 class ReconcileResourceTests(IsolatedAsyncioTestCase):
     async def test_reconcile_commit_resource_skips_missing_commit(self):
         gitlab = Mock()

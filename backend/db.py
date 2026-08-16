@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS repo (
   right_activity_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z',
   queued_left_activity_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z',
   queued_right_activity_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+  bootstrapped_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -141,6 +142,22 @@ CREATE TABLE IF NOT EXISTS gitlab_embedding (
 
 CREATE INDEX IF NOT EXISTS idx_gitlab_embedding_source
   ON gitlab_embedding(repo_id, source_kind, source_key);
+
+ALTER TABLE repo
+  ADD COLUMN IF NOT EXISTS bootstrapped_at TIMESTAMPTZ;
+
+-- Repositories that already have tasks predate the explicit inventory
+-- bootstrap marker. Mark them as migrated without requeueing the whole
+-- installation; repositories such as a newly discovered but never queued
+-- project remain NULL and receive a real bootstrap on their next scan.
+UPDATE repo
+SET bootstrapped_at = updated_at
+WHERE bootstrapped_at IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM gitlab_task
+    WHERE gitlab_task.repo_id = repo.id
+  );
 """
 
 
@@ -186,6 +203,7 @@ class Database:
                         right_activity_at,
                         queued_left_activity_at,
                         queued_right_activity_at,
+                        bootstrapped_at,
                         updated_at
                     )
                     VALUES (
@@ -198,6 +216,7 @@ class Database:
                         %(right_activity_at)s,
                         %(queued_left_activity_at)s,
                         %(queued_right_activity_at)s,
+                        %(bootstrapped_at)s,
                         now()
                     )
                     ON CONFLICT (id)
@@ -222,6 +241,10 @@ class Database:
                             EXCLUDED.queued_right_activity_at,
                             repo.queued_right_activity_at
                         ),
+                        bootstrapped_at = COALESCE(
+                            EXCLUDED.bootstrapped_at,
+                            repo.bootstrapped_at
+                        ),
                         updated_at = now()
                     """,
                     {
@@ -240,6 +263,7 @@ class Database:
                             "queued_right_activity_at",
                             repo.get("right_activity_at", EPOCH),
                         ),
+                        "bootstrapped_at": repo.get("bootstrapped_at"),
                     },
                 )
             conn.commit()
@@ -259,6 +283,7 @@ class Database:
                         right_activity_at,
                         queued_left_activity_at,
                         queued_right_activity_at,
+                        bootstrapped_at,
                         updated_at
                     FROM repo
                     WHERE id = %s
@@ -272,7 +297,12 @@ class Database:
 
         return dict(row)
 
-    def enqueue_project_tasks(self, repo: dict, tasks: dict[str, list[str]]) -> None:
+    def enqueue_project_tasks(
+        self,
+        repo: dict,
+        tasks: dict[str, list[str]],
+        mark_bootstrapped: bool = False,
+    ) -> None:
         with self.connection() as conn:
             with conn.cursor() as cur:
                 self.ensure_repo_in_cursor(cur, repo)
@@ -290,6 +320,17 @@ class Database:
 
                 for branch_name in tasks.get("branches", []):
                     self._enqueue_task(cur, repo["id"], "branch", branch_name)
+
+                if mark_bootstrapped:
+                    cur.execute(
+                        """
+                        UPDATE repo
+                        SET bootstrapped_at = COALESCE(bootstrapped_at, now()),
+                            updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (repo["id"],),
+                    )
 
             conn.commit()
 
@@ -849,6 +890,7 @@ class Database:
                 right_activity_at,
                 queued_left_activity_at,
                 queued_right_activity_at,
+                bootstrapped_at,
                 updated_at
             )
             VALUES (
@@ -861,6 +903,7 @@ class Database:
                 %(right_activity_at)s,
                 %(queued_left_activity_at)s,
                 %(queued_right_activity_at)s,
+                %(bootstrapped_at)s,
                 now()
             )
             ON CONFLICT (id)
@@ -873,6 +916,10 @@ class Database:
                 right_activity_at = EXCLUDED.right_activity_at,
                 queued_left_activity_at = EXCLUDED.queued_left_activity_at,
                 queued_right_activity_at = EXCLUDED.queued_right_activity_at,
+                bootstrapped_at = COALESCE(
+                    EXCLUDED.bootstrapped_at,
+                    repo.bootstrapped_at
+                ),
                 updated_at = now()
             """,
             {
@@ -885,6 +932,7 @@ class Database:
                 "right_activity_at": repo["right_activity_at"],
                 "queued_left_activity_at": repo["queued_left_activity_at"],
                 "queued_right_activity_at": repo["queued_right_activity_at"],
+                "bootstrapped_at": repo.get("bootstrapped_at"),
             },
         )
 
@@ -1111,9 +1159,13 @@ async def get_repo_async(repo_id: int) -> dict | None:
     return await asyncio.to_thread(get_repo, repo_id)
 
 
-def enqueue_project_tasks(repo: dict, tasks: dict[str, list[str]]) -> None:
+def enqueue_project_tasks(
+    repo: dict,
+    tasks: dict[str, list[str]],
+    mark_bootstrapped: bool = False,
+) -> None:
     try:
-        database.enqueue_project_tasks(repo, tasks)
+        database.enqueue_project_tasks(repo, tasks, mark_bootstrapped)
     except Exception:
         logger.exception(
             "postgres task enqueue failed repo_id=%s path=%s",
@@ -1124,9 +1176,16 @@ def enqueue_project_tasks(repo: dict, tasks: dict[str, list[str]]) -> None:
 
 
 async def enqueue_project_tasks_async(
-    repo: dict, tasks: dict[str, list[str]]
+    repo: dict,
+    tasks: dict[str, list[str]],
+    mark_bootstrapped: bool = False,
 ) -> None:
-    await asyncio.to_thread(enqueue_project_tasks, repo, tasks)
+    await asyncio.to_thread(
+        enqueue_project_tasks,
+        repo,
+        tasks,
+        mark_bootstrapped,
+    )
 
 
 def enqueue_task(repo_id: int, task_kind: str, task_key: str) -> None:

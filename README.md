@@ -5,6 +5,8 @@ GitLab fact indexer.
 ## What It Does
 
 - Reconcile GitLab projects.
+- Bootstrap the complete branch, issue, and merge-request inventory when a
+  project is first discovered.
 - Read issues, merge requests, commits, and notes.
 - Split long text into chunks.
 - Embed chunks with llama-server.
@@ -12,6 +14,13 @@ GitLab fact indexer.
 - Search by text.
 - Return content with source links.
 - Serve a small search frontend.
+
+Projects are scanned by most recent GitLab activity first. To submit one
+project immediately without waiting for the global scan:
+
+```sh
+curl -X POST http://localhost:8000/reconcile/projects/451
+```
 
 ## Environment
 
