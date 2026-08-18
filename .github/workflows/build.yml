@@ -2,8 +2,6 @@ name: Build and Push Docker Image
 run-name: Build and Push ${{ github.ref_name }}
 on:
   push:
-    tags:
-      - '*.*.*'
 jobs:
   call-docker-build:
     strategy:
