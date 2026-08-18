@@ -46,6 +46,20 @@ class GitLabProjectTests(TestCase):
             inventory,
         )
 
+    def test_list_branch_commit_shas_returns_complete_history(self):
+        client = GitLabClient("https://gitlab.example.com", "token")
+        client._get_all = Mock(
+            return_value=[{"id": "head-sha"}, {"id": "parent-sha"}]
+        )
+
+        shas = client.list_branch_commit_shas("451", "main")
+
+        self.assertEqual(["head-sha", "parent-sha"], shas)
+        client._get_all.assert_called_once_with(
+            "/api/v4/projects/451/repository/commits",
+            params={"ref_name": "main", "per_page": 100},
+        )
+
 
 class GitLabEventWindowTests(TestCase):
     def test_same_day_events_are_retrieved_with_date_overlap(self):

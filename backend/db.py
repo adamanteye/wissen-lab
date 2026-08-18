@@ -747,6 +747,39 @@ class Database:
 
         return rows
 
+    def enqueue_missing_commit_tasks(
+        self,
+        repo_id: int,
+        shas: list[str],
+    ) -> list[str]:
+        unique_shas = list(dict.fromkeys(str(sha) for sha in shas if sha))
+        if not unique_shas:
+            return []
+
+        with self.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT sha
+                    FROM git_commit
+                    WHERE repo_id = %s
+                      AND sha = ANY(%s)
+                      AND indexed_at IS NOT NULL
+                    """,
+                    (repo_id, unique_shas),
+                )
+                indexed_shas = {row[0] for row in cur.fetchall()}
+                missing_shas = [
+                    sha for sha in unique_shas if sha not in indexed_shas
+                ]
+
+                for sha in missing_shas:
+                    self._upsert_commit_placeholder(cur, repo_id, sha)
+                    self._enqueue_task(cur, repo_id, "commit", sha)
+            conn.commit()
+
+        return missing_shas
+
     def replace_embeddings(
         self,
         repo_id: int,
@@ -1431,6 +1464,32 @@ async def enqueue_branch_missing_commits_async(
         enqueue_branch_missing_commits,
         repo_id,
         branch_name,
+    )
+
+
+def enqueue_missing_commit_tasks(
+    repo_id: int,
+    shas: list[str],
+) -> list[str]:
+    try:
+        return database.enqueue_missing_commit_tasks(repo_id, shas)
+    except Exception:
+        logger.exception(
+            "postgres commit tasks enqueue failed repo_id=%s commit_count=%s",
+            repo_id,
+            len(shas),
+        )
+        raise
+
+
+async def enqueue_missing_commit_tasks_async(
+    repo_id: int,
+    shas: list[str],
+) -> list[str]:
+    return await asyncio.to_thread(
+        enqueue_missing_commit_tasks,
+        repo_id,
+        shas,
     )
 
 

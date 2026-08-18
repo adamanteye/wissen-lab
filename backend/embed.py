@@ -10,7 +10,7 @@ from logutil import get_logger
 LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "").rstrip("/")
 LLAMA_SERVER_API_KEY = os.getenv("LLAMA_SERVER_API_KEY", "")
 LLAMA_SERVER_TIMEOUT_SECONDS = float(
-    os.getenv("LLAMA_SERVER_TIMEOUT_SECONDS", "30")
+    os.getenv("LLAMA_SERVER_TIMEOUT_SECONDS", "120")
 )
 logger = get_logger("llama_server")
 

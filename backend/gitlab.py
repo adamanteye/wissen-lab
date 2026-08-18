@@ -172,6 +172,39 @@ class GitLabClient:
         )
         return self._get(path)
 
+    def list_branch_commit_shas(
+        self,
+        project_id: str | int,
+        branch_name: str,
+    ) -> list[str]:
+        path = (
+            f"/api/v4/projects/{quote(str(project_id), safe='')}"
+            "/repository/commits"
+        )
+        commits = self._get_all(
+            path,
+            params={
+                "ref_name": branch_name,
+                "per_page": 100,
+            },
+        )
+        return [str(commit["id"]) for commit in commits if commit.get("id")]
+
+    def get_commit_object_from_metadata(
+        self,
+        project_id: str | int,
+        commit: dict,
+    ) -> Commit:
+        project = self.get_project(project_id)
+        sha = str(commit["id"])
+        diffs = self.list_commit_diffs(project["id"], sha)
+        return Commit.from_gitlab(
+            int(project["id"]),
+            commit,
+            diffs,
+            url=self._commit_url(project, sha),
+        )
+
     def list_commit_diffs(self, project_id: str | int, sha: str) -> list[dict]:
         path = (
             f"/api/v4/projects/{quote(str(project_id), safe='')}"
@@ -183,15 +216,8 @@ class GitLabClient:
         return []
 
     def get_commit_object(self, project_id: str | int, sha: str) -> Commit:
-        project = self.get_project(project_id)
-        commit = self.get_commit(project["id"], sha)
-        diffs = self.list_commit_diffs(project["id"], sha)
-        return Commit.from_gitlab(
-            int(project["id"]),
-            commit,
-            diffs,
-            url=self._commit_url(project, sha),
-        )
+        commit = self.get_commit(project_id, sha)
+        return self.get_commit_object_from_metadata(project_id, commit)
 
     def compare_commits(
         self, project_id: str | int, from_sha: str, to_sha: str

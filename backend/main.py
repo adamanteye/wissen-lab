@@ -15,7 +15,7 @@ from db import (
     commit_needs_index_async,
     complete_task_async,
     count_remaining_tasks_async,
-    enqueue_branch_missing_commits_async,
+    enqueue_missing_commit_tasks_async,
     enqueue_project_tasks_async,
     enqueue_task_async,
     ensure_repo_async,
@@ -232,8 +232,17 @@ async def reconcile_branch_resource(gitlab, project_id: str, branch_name: str):
         )
 
     await upsert_branch_async(repo_id, branch_name, head_sha)
-    queued_commits = await enqueue_branch_missing_commits_async(
-        repo_id, branch_name
+    branch_commit_shas = await run_gitlab_call(
+        gitlab.list_branch_commit_shas,
+        project_id,
+        branch_name,
+    )
+    branch_commit_shas = list(
+        dict.fromkeys([head_sha, *branch_commit_shas])
+    )
+    queued_commits = await enqueue_missing_commit_tasks_async(
+        repo_id,
+        branch_commit_shas,
     )
     logger.info(
         "branch reconciled project_id=%s branch=%s head_sha=%s queued_commit_count=%s",
@@ -253,8 +262,10 @@ async def reconcile_commit_resource(gitlab, project_id: str, sha: str):
     repo_id = int(project_id)
 
     try:
-        commit = await run_gitlab_call(
-            gitlab.get_commit_object, project_id, sha
+        commit_metadata = await run_gitlab_call(
+            gitlab.get_commit,
+            project_id,
+            sha,
         )
     except GitLabNotFoundError:
         logger.warning(
@@ -266,6 +277,20 @@ async def reconcile_commit_resource(gitlab, project_id: str, sha: str):
         await mark_commit_indexed_async(repo_id, sha)
         return None
 
+    parent_shas = [
+        str(parent_sha)
+        for parent_sha in commit_metadata.get("parent_ids") or []
+        if parent_sha
+    ]
+    for parent_sha in parent_shas:
+        if await commit_needs_index_async(repo_id, parent_sha):
+            await enqueue_task_async(repo_id, "commit", parent_sha)
+
+    commit = await run_gitlab_call(
+        gitlab.get_commit_object_from_metadata,
+        project_id,
+        commit_metadata,
+    )
     await upsert_commit_async(commit)
     chunk_result = CommitChunkBuilder().build(commit)
     await index_chunk_result("commit", chunk_result)
@@ -276,10 +301,6 @@ async def reconcile_commit_resource(gitlab, project_id: str, sha: str):
         commit.sha,
         len(commit.parent_shas),
     )
-
-    for parent_sha in commit.parent_shas:
-        if await commit_needs_index_async(commit.repo_id, parent_sha):
-            await enqueue_task_async(commit.repo_id, "commit", parent_sha)
 
     return commit.sha
 
@@ -552,19 +573,37 @@ async def project_scan_loop():
         await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
 
 
-async def task_consumer_loop():
-    gitlab = GitLabClient()
-
+async def task_consumer_worker(gitlab, worker_id: int):
     while True:
         try:
-            processed_tasks = await process_task_batch(gitlab)
-        except Exception:
-            logger.exception("task batch iteration failed")
-            processed_tasks = []
+            task = await claim_task_async(TASK_MAX_FAILURES)
+            if task is None:
+                await asyncio.sleep(TASK_IDLE_SECONDS)
+                continue
 
-        if processed_tasks:
-            continue
-        await asyncio.sleep(TASK_IDLE_SECONDS)
+            logger.info(
+                "task claimed worker_id=%s task_id=%s project_id=%s task_kind=%s task_key=%s failure_count=%s",
+                worker_id,
+                task["id"],
+                task["repo_id"],
+                task["task_kind"],
+                task["task_key"],
+                task["failure_count"],
+            )
+            await process_claimed_task(gitlab, task)
+        except Exception:
+            logger.exception("task consumer worker failed worker_id=%s", worker_id)
+            await asyncio.sleep(TASK_IDLE_SECONDS)
+
+
+async def task_consumer_loop():
+    gitlab = GitLabClient()
+    await asyncio.gather(
+        *(
+            task_consumer_worker(gitlab, worker_id)
+            for worker_id in range(TASK_BATCH_SIZE)
+        )
+    )
 
 
 @app.on_event("startup")

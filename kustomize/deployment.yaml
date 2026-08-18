@@ -30,6 +30,8 @@ spec:
                   key: token
             - name: LLAMA_SERVER_URL
               value: https://llama.cpp.example.com/embedding
+            - name: LLAMA_SERVER_TIMEOUT_SECONDS
+              value: "120"
             - name: LLAMA_SERVER_API_KEY
               valueFrom:
                 secretKeyRef:

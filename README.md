@@ -30,7 +30,7 @@ curl -X POST http://localhost:8000/reconcile/projects/451
 - `GITLAB_API_TOKEN`: GitLab API token.
 - `LLAMA_SERVER_URL`: llama-server URL.
 - `LLAMA_SERVER_API_KEY`: llama-server API key.
-- `LLAMA_SERVER_TIMEOUT_SECONDS`: Timeout for each embedding request. Default `30`.
+- `LLAMA_SERVER_TIMEOUT_SECONDS`: Timeout for each embedding request. Default `120`.
 - `TASK_MAX_FAILURES`: Max task failures before the reconciler treats the task as settled and advances project activity windows. Default `3`.
 - `BATCH_SIZE_LIMIT`: Max chars per chunk before split. Default `8192`.
 

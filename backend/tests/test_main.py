@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -69,7 +70,7 @@ async def count_remaining_tasks_async(*args, **kwargs):
     return 0
 
 
-async def enqueue_branch_missing_commits_async(*args, **kwargs):
+async def enqueue_missing_commit_tasks_async(*args, **kwargs):
     return []
 
 
@@ -77,9 +78,7 @@ db_stub.claim_task_async = claim_task_async
 db_stub.commit_needs_index_async = commit_needs_index_async
 db_stub.complete_task_async = noop_async
 db_stub.count_remaining_tasks_async = count_remaining_tasks_async
-db_stub.enqueue_branch_missing_commits_async = (
-    enqueue_branch_missing_commits_async
-)
+db_stub.enqueue_missing_commit_tasks_async = enqueue_missing_commit_tasks_async
 db_stub.enqueue_project_tasks_async = noop_async
 db_stub.enqueue_task_async = noop_async
 db_stub.ensure_repo_async = noop_async
@@ -114,6 +113,7 @@ embed_stub.embed_search_text = embed_search_text
 sys.modules["embed"] = embed_stub
 
 import main
+from chunking import Commit
 from gitlab import GitLabNotFoundError
 
 
@@ -294,7 +294,7 @@ class ReconcileProjectEndpointTests(IsolatedAsyncioTestCase):
 class ReconcileResourceTests(IsolatedAsyncioTestCase):
     async def test_reconcile_commit_resource_skips_missing_commit(self):
         gitlab = Mock()
-        gitlab.get_commit_object.side_effect = GitLabNotFoundError(
+        gitlab.get_commit.side_effect = GitLabNotFoundError(
             "https://gitlab.example.com"
         )
 
@@ -328,6 +328,10 @@ class ReconcileResourceTests(IsolatedAsyncioTestCase):
     async def test_reconcile_branch_resource_queues_missing_commits(self):
         gitlab = Mock()
         gitlab.get_branch.return_value = {"commit": {"id": "head-sha"}}
+        gitlab.list_branch_commit_shas.return_value = [
+            "head-sha",
+            "parent-sha",
+        ]
 
         with (
             patch.object(
@@ -342,9 +346,9 @@ class ReconcileResourceTests(IsolatedAsyncioTestCase):
             ) as upsert_branch_async,
             patch.object(
                 main,
-                "enqueue_branch_missing_commits_async",
+                "enqueue_missing_commit_tasks_async",
                 new=AsyncMock(return_value=["head-sha", "parent-sha"]),
-            ) as enqueue_branch_missing_commits_async,
+            ) as enqueue_missing_commit_tasks_async,
         ):
             result = await main.reconcile_branch_resource(
                 gitlab,
@@ -361,7 +365,64 @@ class ReconcileResourceTests(IsolatedAsyncioTestCase):
             result,
         )
         upsert_branch_async.assert_awaited_once_with(2, "main", "head-sha")
-        enqueue_branch_missing_commits_async.assert_awaited_once_with(2, "main")
+        gitlab.list_branch_commit_shas.assert_called_once_with("2", "main")
+        enqueue_missing_commit_tasks_async.assert_awaited_once_with(
+            2,
+            ["head-sha", "parent-sha"],
+        )
+
+    async def test_commit_embedding_failure_does_not_block_parent_task(self):
+        gitlab = Mock()
+        commit_metadata = {
+            "id": "child-sha",
+            "parent_ids": ["parent-sha"],
+        }
+        gitlab.get_commit.return_value = commit_metadata
+        gitlab.get_commit_object_from_metadata.return_value = Commit(
+            repo_id=2,
+            sha="child-sha",
+            parent_shas=["parent-sha"],
+        )
+
+        with (
+            patch.object(
+                main,
+                "run_gitlab_call",
+                new=direct_gitlab_call,
+            ),
+            patch.object(
+                main,
+                "commit_needs_index_async",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                main,
+                "enqueue_task_async",
+                new=AsyncMock(),
+            ) as enqueue_task_async,
+            patch.object(
+                main,
+                "upsert_commit_async",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                main,
+                "index_chunk_result",
+                new=AsyncMock(side_effect=TimeoutError()),
+            ),
+        ):
+            with self.assertRaises(TimeoutError):
+                await main.reconcile_commit_resource(
+                    gitlab,
+                    "2",
+                    "child-sha",
+                )
+
+        enqueue_task_async.assert_awaited_once_with(
+            2,
+            "commit",
+            "parent-sha",
+        )
 
     async def test_reconcile_branch_resource_marks_deleted_branch(self):
         gitlab = Mock()
@@ -462,6 +523,48 @@ class SearchEndpointTests(IsolatedAsyncioTestCase):
 
 
 class TaskConsumerTests(IsolatedAsyncioTestCase):
+    async def test_consumer_worker_replenishes_without_waiting_for_sibling(self):
+        gitlab = Mock()
+        tasks = [
+            {
+                "id": task_id,
+                "repo_id": 2,
+                "task_kind": "commit",
+                "task_key": f"sha-{task_id}",
+                "failure_count": 0,
+            }
+            for task_id in range(1, 4)
+        ]
+        slow_task_released = asyncio.Event()
+        third_task_started = asyncio.Event()
+
+        async def claim_task(*args, **kwargs):
+            if tasks:
+                return tasks.pop(0)
+            await asyncio.Future()
+
+        async def process_task(gitlab_client, task):
+            if task["id"] == 1:
+                await slow_task_released.wait()
+            elif task["id"] == 3:
+                third_task_started.set()
+                await asyncio.Future()
+
+        with (
+            patch.object(main, "GitLabClient", return_value=gitlab),
+            patch.object(main, "TASK_BATCH_SIZE", 2),
+            patch.object(main, "claim_task_async", new=claim_task),
+            patch.object(main, "process_claimed_task", new=process_task),
+        ):
+            consumer = asyncio.create_task(main.task_consumer_loop())
+            try:
+                await asyncio.wait_for(third_task_started.wait(), timeout=1)
+                self.assertFalse(slow_task_released.is_set())
+            finally:
+                consumer.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await consumer
+
     async def test_process_claimed_task_uses_supplied_task(self):
         gitlab = Mock()
         task = {
